@@ -1,0 +1,12 @@
+{
+  "name": "studio-manager-online",
+  "version": "2.2.0",
+  "private": true,
+  "description": "Studio Manager PRO 2.2.0 - quote catalog links, isolated demo contracts, mobile web app experience",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
