@@ -1,0 +1,59 @@
+הגדרת סנכרון Google Calendar – Studio Manager
+================================================
+
+מה הסנכרון עושה
+----------------
+- בעת שמירת אירוע חדש, האפליקציה יוצרת אירוע פרטי ביומן Google.
+- בעת שמירת שינויים לאירוע שכבר סונכרן, האירוע הקיים מתעדכן ולא נוצר עותק חדש.
+- כותרת: סוג האירוע ושמות בני הזוג.
+- מיקום: האולם/המקום שהוזן בכרטיס האירוע.
+- תאריך: אירוע של יום שלם, כי טופס Studio Manager הנוכחי שומר תאריך אך לא שעת התחלה/סיום.
+- תזכורת קופצת: ברירת מחדל יום לפני. ניתן לבחור שעה, יום, יומיים או שבוע לפני בהגדרות.
+- לא נשלחות הזמנות לבני הזוג; האירוע נשמר ביומן הפרטי שלך בלבד.
+
+חשוב: החיבור של Google Calendar בתוך ChatGPT אינו מעניק הרשאת OAuth לאפליקציית Studio Manager. נדרש חיבור נפרד של האפליקציה מול Google.
+
+חלק א – פריסת השרת
+-------------------
+1. העלה את תיקיית StudioManager_Online_v2 למאגר פרטי ב-GitHub.
+2. ב-Render בחר New > Blueprint וחבר את המאגר.
+3. לאחר פריסה, העתק את כתובת השירות הציבורית HTTPS של Render.
+4. ב-Render > Environment ודא שקיימים STUDIO_ADMIN_KEY, STUDIO_DATA_DIR ו-GOOGLE_TOKEN_ENCRYPTION_KEY.
+5. הוסף שני משתני סביבה: GOOGLE_OAUTH_CLIENT_ID ו-GOOGLE_OAUTH_CLIENT_SECRET.
+6. שמור ובצע Deploy מחדש.
+
+חלק ב – Google Cloud OAuth
+--------------------------
+1. פתח https://console.cloud.google.com/ ובחר או צור פרויקט.
+2. APIs & Services > Library > הפעל Google Calendar API.
+3. Google Auth Platform > Branding: הגדר שם אפליקציה ודוא״ל קשר.
+4. Google Auth Platform > Audience: אם האפליקציה במצב Testing, הוסף את כתובת Gmail שלך כ-Test user.
+5. Google Auth Platform > Clients > Create Client > Web application.
+6. תחת Authorized redirect URIs הוסף בדיוק: https://כתובת-השרת-שלך.onrender.com/auth/google/callback
+7. העתק Client ID ו-Client Secret למשתני הסביבה המתאימים ב-Render ובצע Deploy מחדש.
+
+חלק ג – חיבור באפליקציה
+-----------------------
+1. פתח את Studio Manager בכתובת הציבורית של Render (לא localhost ולא file://).
+2. היכנס להגדרות > קישורים אישיים לזוגות.
+3. הזן כתובת HTTPS ומפתח מנהל (STUDIO_ADMIN_KEY), לחץ שמירת חיבור.
+4. באזור סנכרון Google Calendar לחץ התחברות ל-Google Calendar ואשר את ההרשאה.
+5. אחרי החזרה למערכת לחץ בדיקת חיבור.
+6. בחר תזכורת ושמור הגדרות סנכרון.
+
+בדיקת פעולה
+-----------
+צור אירוע בדיקה עם שם, תאריך ומיקום ושמור. אמורה להופיע הודעה שהאירוע נוסף ליומן Google. ערוך את המיקום ושמור שוב; האירוע הקיים אמור להתעדכן ולא להיווצר כפול.
+
+הערות
+-----
+- אירועים ישנים לא יועלו אוטומטית בעת החיבור הראשון; יש לשמור אותם מחדש או לבנות ייבוא היסטורי נפרד.
+- אירוע ללא תאריך לא יעלה ליומן.
+- ללא חיבור OAuth, האירוע עדיין יישמר ב-Studio Manager אך לא ביומן.
+- מחיקת אירוע באפליקציה אינה מוחקת אותו אוטומטית מיומן Google.
+- אסימון הרענון נשמר מוצפן בדיסק השרת. שמור על סוד המנהל ועל מפתח ההצפנה.
+- זו הרשאת calendar.events בלבד, ללא גישה ל-Gmail או ל-Drive.
+
+מדריכים רשמיים:
+https://developers.google.com/identity/protocols/oauth2/web-server
+https://developers.google.com/workspace/calendar/api/v3/reference/events/insert

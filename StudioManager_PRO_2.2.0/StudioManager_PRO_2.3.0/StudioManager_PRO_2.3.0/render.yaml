@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: studio-manager-ofir
+    runtime: node
+    plan: 0.5c-512mb
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    disk:
+      name: studio-manager-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: STUDIO_ADMIN_KEY
+        generateValue: true
+      - key: STUDIO_DATA_DIR
+        value: /var/data
+
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_TOKEN_ENCRYPTION_KEY
+        generateValue: true
