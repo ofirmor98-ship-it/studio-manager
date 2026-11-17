@@ -1,6 +1,6 @@
 {
   "name": "studio-manager-online",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "private": true,
   "description": "Studio Manager PRO 2.3.0 - password login, multi-device sync, installable app, quote catalog links, isolated demo contracts, mobile web app experience",
   "scripts": {

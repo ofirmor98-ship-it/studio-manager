@@ -210,7 +210,7 @@ function cleanSnapshot(snapshot) {
     business: { name: safeString(business.name, 160), phone: safeString(business.phone, 50), email: safeString(business.email, 160), website: safeString(business.website, 220) },
     event: { id: safeString(event.id, 120), clientName: safeString(event.clientName, 120), clientSecondName: safeString(event.clientSecondName, 120), clientPhone: safeString(event.clientPhone, 40), clientEmail: safeString(event.clientEmail, 160), clientIdNumber: safeString(event.clientIdNumber, 60), clientAddress: safeString(event.clientAddress, 250), type: safeString(event.type, 60), typeLabel: safeString(event.typeLabel, 80), date: safeString(event.date, 20), venue: safeString(event.venue, 200), payments: Array.isArray(event.payments) ? event.payments.slice(0, 100).map(x => ({ amount: Math.max(0, Number(x.amount)||0), date: safeString(x.date, 20), method: safeString(x.method, 60), note: safeString(x.note, 200) })) : [] },
     contract: { terms: safeString(contract.terms, 25000), endTime: safeString(contract.endTime, 10), extraHourRate: safeString(contract.extraHourRate, 30), vatStatus: safeString(contract.vatStatus, 30), photoDeliveryDays: safeString(contract.photoDeliveryDays, 20), videoDeliveryDays: safeString(contract.videoDeliveryDays, 20), albumDeliveryDays: safeString(contract.albumDeliveryDays, 20), publicationConsent: safeString(contract.publicationConsent, 10), paymentTerms: safeString(contract.paymentTerms, 3000), cancellationTerms: safeString(contract.cancellationTerms, 4000), extraConditions: safeString(contract.extraConditions, 4000) },
-    packages: normalizedPackages, builderOptions: (Array.isArray(snapshot.builderOptions)?snapshot.builderOptions.slice(0,100):[]).map(o=>({id:safeString(o.id,120),name:safeString(o.name,120),category:safeString(o.category,80),unit:safeString(o.unit,40),active:o.active!==false})).filter(o=>o.id&&o.name&&o.active), contractStyle: snapshot.contractStyle || {}
+    packages: normalizedPackages, builderOptions: (Array.isArray(snapshot.builderOptions)?snapshot.builderOptions.slice(0,100):[]).map(o=>({id:safeString(o.id,120),name:safeString(o.name,120),category:safeString(o.category,80),unit:safeString(o.unit,40),selectionType:o.selectionType==='yesno'?'yesno':'quantity',active:o.active!==false})).filter(o=>o.id&&o.name&&o.active), contractStyle: snapshot.contractStyle || {}
   };
 }
 function validateBuilderSelection(snapshot, rawItems) {
@@ -221,9 +221,9 @@ function validateBuilderSelection(snapshot, rawItems) {
   for (const raw of rawItems) {
     const option = catalog.get(safeString(raw.id, 120));
     const quantity = Math.floor(Number(raw.quantity));
-    if (!option || !Number.isFinite(quantity) || quantity < 1 || quantity > 10 || seen.has(option.id)) throw Object.assign(new Error('אחת מבחירות החבילה אינה תקינה. רעננו את הקישור ונסו שוב.'), { status: 400 });
+    if (!option || !Number.isFinite(quantity) || quantity < 1 || quantity > (option.selectionType === 'yesno' ? 1 : 10) || seen.has(option.id)) throw Object.assign(new Error('אחת מבחירות החבילה אינה תקינה. רעננו את הקישור ונסו שוב.'), { status: 400 });
     seen.add(option.id);
-    items.push({ id: option.id, name: option.name, category: option.category, unit: option.unit, quantity });
+    items.push({ id: option.id, name: option.name, category: option.category, unit: option.unit, selectionType: option.selectionType === 'yesno' ? 'yesno' : 'quantity', quantity });
   }
   return { items };
 }
@@ -232,8 +232,8 @@ function publicProposal(p) {
   const event = { ...(p.snapshot.event || {}) };
   let packages = p.snapshot.packages || [];
   let contract = p.snapshot.contract || {};
-  if (mode === 'quote') { event.clientIdNumber = ''; event.clientAddress = ''; event.payments = []; contract = {}; if (p.showPrices === false) { delete event.price; delete event.discount; packages = packages.map(({ price, ...rest }) => rest); } }
-  return { id: p.id, mode, showPrices: p.showPrices !== false, demoMode: mode === 'demo', event, business: p.snapshot.business, contract, packages, builderOptions: (p.snapshot.builderOptions||[]).map(o=>({id:o.id,name:o.name,category:o.category,unit:o.unit,active:o.active!==false})), contractStyle: p.snapshot.contractStyle, status: p.status, expiresAt: p.expiresAt, quoteRequestSent: p.status === 'quote-requested', submission: p.submission || null };
+  if (mode === 'quote' || mode === 'catalog') { event.clientIdNumber = ''; event.clientAddress = ''; event.payments = []; contract = {}; if (p.showPrices === false) { delete event.price; delete event.discount; packages = packages.map(({ price, ...rest }) => rest); } }
+  return { id: p.id, mode, showPrices: p.showPrices !== false, demoMode: mode === 'demo', event, business: p.snapshot.business, contract, packages, builderOptions: (p.snapshot.builderOptions||[]).map(o=>({id:o.id,name:o.name,category:o.category,unit:o.unit,selectionType:o.selectionType==='yesno'?'yesno':'quantity',active:o.active!==false})), contractStyle: p.snapshot.contractStyle, status: p.status, expiresAt: p.expiresAt, quoteRequestSent: p.status === 'quote-requested', submission: p.submission || null };
 }
 function parsePath(pathname) { return pathname.split('/').filter(Boolean).map(decodeURIComponent); }
 async function serveFile(res, file, type) {
@@ -444,10 +444,63 @@ const server = http.createServer(async (req, res) => {
       const clientEmail = safeString(body.clientEmail, 160).trim();
       if (clientEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) return json(res, 400, { error: 'כתובת הדוא״ל אינה תקינה' });
       const requestedAt = new Date().toISOString();
-      p.customRequest = { clientName, clientPhone, clientEmail, clientAddress: safeString(body.clientAddress, 250).trim(), clientNote: safeString(body.clientNote, 1500).trim(), extraRequests: safeString(body.extraRequests, 1500).trim(), items: chosen.items, details: chosen.items.map(x => `${x.name} – ${x.quantity} ${x.unit}`).join('\n'), requestedAt };
+      p.customRequest = { clientName, clientPhone, clientEmail, clientAddress: safeString(body.clientAddress, 250).trim(), clientNote: safeString(body.clientNote, 1500).trim(), extraRequests: safeString(body.extraRequests, 1500).trim(), items: chosen.items, details: chosen.items.map(x => x.selectionType === 'yesno' ? `${x.name} – ✓` : `${x.name} – ${x.quantity} ${x.unit}`).join('\n'), requestedAt };
       if (p.mode === 'quote') p.status = 'quote-requested';
       await persist();
       return json(res, 201, { ok: true, requestedAt, message: 'הבחירה התקבלה ותועבר לצלם להצעת מחיר' });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/admin/catalog-links') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      const body = await readBody(req);
+      const raw = body.snapshot && typeof body.snapshot === 'object' ? body.snapshot : {};
+      const snapshot = cleanSnapshot({ ...raw, event: { id: 'catalog', clientName: 'catalog', date: '2000-01-01' } });
+      snapshot.event = { id: 'catalog', clientName: '', clientSecondName: '', clientPhone: '', clientEmail: '', clientIdNumber: '', clientAddress: '', type: '', typeLabel: '', date: '', venue: '', payments: [] };
+      snapshot.contract = {};
+      const token = crypto.randomBytes(24).toString('base64url'), id = crypto.randomUUID();
+      const createdAt = new Date().toISOString(), expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+      store.proposals[hashToken(token)] = { id, eventId: 'catalog', snapshot, mode: 'catalog', showPrices: body.showPrices !== false, status: 'open', createdAt, expiresAt, requests: [] };
+      await persist();
+      return json(res, 201, { id, token, url: `${requestBase(req)}/p/${token}`, createdAt, expiresAt });
+    }
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'public' && parts[2] === 'proposals' && parts[3] && parts[4] === 'catalog-request') {
+      const p = store.proposals[hashToken(parts[3])];
+      if (!p || p.mode !== 'catalog' || p.status !== 'open' || Date.now() > Date.parse(p.expiresAt)) return json(res, 404, { error: 'הקישור אינו זמין או שפג תוקפו' });
+      p.requests = Array.isArray(p.requests) ? p.requests : [];
+      if (p.requests.length >= 1000) return json(res, 429, { error: 'לא ניתן לקבל בקשות נוספות בקישור זה. פנו לצלם.' });
+      const body = await readBody(req);
+      const clientName = safeString(body.clientName, 120).trim(), clientPhone = safeString(body.clientPhone, 40).trim();
+      if (!clientName || !clientPhone) return json(res, 400, { error: 'יש למלא שם וטלפון ליצירת קשר' });
+      const clientEmail = safeString(body.clientEmail, 160).trim();
+      if (clientEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) return json(res, 400, { error: 'כתובת הדוא״ל אינה תקינה' });
+      const eventDate = safeString(body.eventDate, 10);
+      if (!validIsoDate(eventDate)) return json(res, 400, { error: 'יש לבחור את תאריך האירוע' });
+      const eventType = ['wedding','bar','bat','henna','brit','other'].includes(body.eventType) ? body.eventType : 'other';
+      let pkg = null, items = [], details = '';
+      if (Array.isArray(body.items) && body.items.length) {
+        items = validateBuilderSelection(p.snapshot, body.items).items;
+        details = items.map(x => x.selectionType === 'yesno' ? `${x.name} – ✓` : `${x.name} – ${x.quantity} ${x.unit}`).join('\n');
+      } else {
+        const selected = (p.snapshot.packages || []).find(x => x.id === safeString(body.selectedPackageId, 120));
+        if (!selected || selected.isBuilder) return json(res, 400, { error: 'יש לבחור אחת מהחבילות המוצגות' });
+        pkg = { id: selected.id, name: selected.name, type: selected.type || '', price: selected.price, details: selected.details };
+        details = selected.details || '';
+      }
+      const request = { id: crypto.randomUUID(), requestedAt: new Date().toISOString(), clientName, clientPhone, clientEmail, eventDate, eventType, venue: safeString(body.venue, 200).trim(), clientNote: safeString(body.clientNote, 1500).trim(), extraRequests: safeString(body.extraRequests, 1500).trim(), package: pkg, items, details, handled: false };
+      p.requests.push(request); await persist();
+      return json(res, 201, { ok: true, requestedAt: request.requestedAt, message: 'הבחירה התקבלה ותועבר לצלם' });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/admin/catalog-requests') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      const rows = [];
+      for (const p of Object.values(store.proposals)) if (p.mode === 'catalog') for (const r of (p.requests || [])) rows.push({ ...r, linkId: p.id });
+      rows.sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
+      return json(res, 200, { requests: rows });
+    }
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'catalog-requests' && parts[3] && parts[4] === 'handled') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      const body = await readBody(req);
+      for (const p of Object.values(store.proposals)) { if (p.mode !== 'catalog') continue; const r = (p.requests || []).find(x => x.id === parts[3]); if (r) { r.handled = body.handled !== false; r.eventId = safeString(body.eventId, 120) || r.eventId || ''; await persist(); return json(res, 200, { ok: true }); } }
+      return json(res, 404, { error: 'הבקשה לא נמצאה' });
     }
     if (req.method === 'POST' && url.pathname === '/api/admin/proposals') {
       if (!adminAuthorized(req)) return authFailure(res);
