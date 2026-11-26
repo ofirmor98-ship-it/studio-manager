@@ -14,7 +14,16 @@ const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
 const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 10;
-let auth = { password: null, sessions: {} };
+let auth = { password: null, sessions: {}, icsToken: null };
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const BACKUP_KEEP = 45;
+const CAL_TZ = 'Asia/Jerusalem';
+const CAL_TYPE_NAMES = { wedding: 'חתונה', bar: 'בר מצווה', bat: 'בת מצווה', henna: 'חינה', brit: 'ברית / בריתה', other: 'אירוע' };
+const CAL_COLORS = { wedding: '5', henna: '6', bar: '9', bat: '3', brit: '10', other: '8' };
+let calendarStatus = { lastRunAt: null, ok: null, message: 'טרם בוצע סנכרון', created: 0, updated: 0, deleted: 0, skipped: 0, errors: [], needsReconnect: false };
+let calendarQueue = Promise.resolve();
+let calendarTimer = null;
+let cachedAccessToken = null;
 const loginAttempts = new Map();
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = String(process.env.STUDIO_BASE_URL || '').replace(/\/$/, '');
@@ -60,10 +69,10 @@ async function persistAuth() {
 async function loadAuth() {
   try {
     const parsed = JSON.parse(await fs.readFile(AUTH_FILE, 'utf8'));
-    auth = { password: parsed.password || null, sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {} };
+    auth = { password: parsed.password || null, sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {}, icsToken: typeof parsed.icsToken === 'string' ? parsed.icsToken : null };
     const now = Date.now();
     for (const [k, v] of Object.entries(auth.sessions)) if (!v || now > Date.parse(v.expiresAt)) delete auth.sessions[k];
-  } catch (e) { if (e.code !== 'ENOENT') console.error('Auth file parse error:', e.message); auth = { password: null, sessions: {} }; }
+  } catch (e) { if (e.code !== 'ENOENT') console.error('Auth file parse error:', e.message); auth = { password: null, sessions: {}, icsToken: null }; }
 }
 function scryptAsync(password, salt) {
   return new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (err, key) => err ? reject(err) : resolve(key)));
@@ -165,13 +174,23 @@ async function loadGoogleToken() {
 async function googleAccessToken() {
   if (!googleCredentialsReady()) throw Object.assign(new Error('חסרים פרטי OAuth של Google בשרת'), { status: 503 });
   if (!googleToken?.refresh_token) throw Object.assign(new Error('יומן Google עדיין לא חובר. פתח הגדרות ולחץ על התחברות ל-Google Calendar.'), { status: 409 });
+  if (googleToken.invalid) throw Object.assign(new Error('ההרשאה של Google פגה או בוטלה. יש ללחוץ שוב על "התחברות ל-Google Calendar" בהגדרות.'), { status: 409, needsReconnect: true });
+  if (cachedAccessToken && cachedAccessToken.expiresAt > Date.now() + 60_000) return cachedAccessToken.token;
   const form = new URLSearchParams({ client_id: process.env.GOOGLE_OAUTH_CLIENT_ID, client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET, refresh_token: googleToken.refresh_token, grant_type: 'refresh_token' });
   const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.access_token) throw Object.assign(new Error(data.error_description || data.error || 'לא ניתן לחדש הרשאה ל-Google Calendar'), { status: 502 });
+  if (!response.ok || !data.access_token) {
+    if (data.error === 'invalid_grant') {
+      // Refresh token expired/revoked. Most common cause: the OAuth app is in "Testing" mode, where Google expires tokens after 7 days.
+      googleToken.invalid = true; googleToken.invalidAt = new Date().toISOString(); cachedAccessToken = null;
+      await saveGoogleToken().catch(() => {});
+      throw Object.assign(new Error('ההרשאה של Google פגה (invalid_grant). אם אפליקציית ה-OAuth ב-Google Cloud במצב "Testing" – ההרשאה פגה כל 7 ימים. יש להעביר אותה ל-"In production" ולהתחבר מחדש.'), { status: 409, needsReconnect: true });
+    }
+    throw Object.assign(new Error(data.error_description || data.error || 'לא ניתן לחדש הרשאה ל-Google Calendar'), { status: 502 });
+  }
+  cachedAccessToken = { token: data.access_token, expiresAt: Date.now() + (Number(data.expires_in) || 3000) * 1000 };
   googleToken.lastAccessTokenAt = new Date().toISOString();
-  if (data.refresh_token) googleToken.refresh_token = data.refresh_token;
-  await saveGoogleToken();
+  if (data.refresh_token) { googleToken.refresh_token = data.refresh_token; await saveGoogleToken(); }
   return data.access_token;
 }
 async function googleCalendarRequest(method, apiPath, accessToken, body) {
@@ -181,8 +200,248 @@ async function googleCalendarRequest(method, apiPath, accessToken, body) {
     ...(body ? { body: JSON.stringify(body) } : {})
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(data.error?.message || `Google Calendar API error ${response.status}`), { status: 502 });
+  if (!response.ok) throw Object.assign(new Error(data.error?.message || `Google Calendar API error ${response.status}`), { status: 502, httpStatus: response.status });
   return data;
+}
+function validTime(value) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || '')); }
+function shiftLocal(date, time, minutes) {
+  const [y, mo, d] = date.split('-').map(Number), [h, mi] = time.split(':').map(Number);
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi + minutes));
+  return { date: t.toISOString().slice(0, 10), time: t.toISOString().slice(11, 16) };
+}
+function tzOffsetMinutes(utcMs, tz) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(utcMs)).map(p => [p.type, p.value]));
+  return (Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second) - utcMs) / 60000;
+}
+function zonedToUtcMs(date, time, tz = CAL_TZ) {
+  const [y, mo, d] = date.split('-').map(Number), [h, mi] = time.split(':').map(Number);
+  const guess = Date.UTC(y, mo - 1, d, h, mi);
+  let ms = guess - tzOffsetMinutes(guess, tz) * 60000;
+  const second = tzOffsetMinutes(ms, tz);
+  ms = guess - second * 60000;
+  return ms;
+}
+function eventTiming(e) {
+  const date = String(e.date || '');
+  if (!validIsoDate(date)) return null;
+  const start = validTime(e.time) ? e.time : '';
+  if (!start) return { allDay: true, startDate: date, endDate: addOneDay(date) };
+  const endRaw = validTime(e.endTime) ? e.endTime : (validTime(e.contract?.endTime) ? e.contract.endTime : '');
+  let end;
+  if (endRaw) { end = { date: endRaw > start ? date : addOneDay(date), time: endRaw }; }
+  else end = shiftLocal(date, start, 6 * 60);
+  return { allDay: false, startDate: date, startTime: start, endDate: end.date, endTime: end.time, defaultEnd: !endRaw };
+}
+function eventDueAmount(e) {
+  const paid = (Array.isArray(e.payments) ? e.payments : []).reduce((s, p) => s + (Number(p?.amount) || 0), 0);
+  return Math.max(0, (Number(e.price) || 0) - (Number(e.discount) || 0) - paid);
+}
+function calendarEventText(e, data, base) {
+  const typeName = CAL_TYPE_NAMES[e.type] || 'אירוע';
+  const names = [e.clientName, e.clientSecondName].map(x => String(x || '').trim()).filter(Boolean);
+  const who = names.length > 1 ? `${names[0]} ו${names[1]}` : (names[0] || 'לקוח');
+  const timing = eventTiming(e);
+  const due = eventDueAmount(e);
+  const money = n => '₪' + Math.round(Number(n) || 0).toLocaleString('he-IL');
+  const dmy = iso => /^\d{4}-\d{2}-\d{2}$/.test(String(iso || '')) ? String(iso).split('-').reverse().join('.') : String(iso || '');
+  const q = e.questionnaire || {}, c = e.contract || {};
+  const payments = Array.isArray(e.payments) ? e.payments.filter(p => Number(p?.amount)) : [];
+  const paid = payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const net = Math.max(0, (Number(e.price) || 0) - (Number(e.discount) || 0));
+  const section = (title, rows) => { const r = rows.filter(Boolean); return r.length ? [`\n━━ ${title} ━━`, ...r] : []; };
+  const lines = [
+    `📸 ${typeName} – ${who}`,
+    ...section('👤 לקוח', [
+      `שם: ${who}`,
+      e.clientPhone ? `טלפון: ${e.clientPhone}` : '',
+      e.clientEmail ? `דוא״ל: ${e.clientEmail}` : '',
+      e.clientAddress ? `כתובת המזמין: ${e.clientAddress}` : ''
+    ]),
+    ...section('📅 האירוע', [
+      `סוג: ${typeName}`,
+      `תאריך: ${dmy(e.date)}`,
+      timing && !timing.allDay ? `שעות: ${timing.startTime}–${timing.endTime}${timing.defaultEnd ? ' (שעת סיום משוערת)' : ''}` : '',
+      e.venue ? `מקום: ${e.venue}` : '',
+      e.venueAddress ? `כתובת / הגעה: ${e.venueAddress}` : '',
+      e.deliveryDate ? `תאריך יעד למסירה: ${dmy(e.deliveryDate)}` : ''
+    ]),
+    ...section('📦 חבילה', [
+      e.packageName ? `חבילה: ${e.packageName}` : '',
+      e.packageDetails ? String(e.packageDetails).replace(/\r/g, '').trim() : ''
+    ]),
+    ...section('💰 כספים', [
+      net ? `מחיר: ${money(net)}${Number(e.discount) ? ` (אחרי הנחה של ${money(e.discount)})` : ''}` : '',
+      net || paid ? `שולם: ${money(paid)} · יתרה לתשלום: ${money(due)}` : '',
+      ...payments.slice(0, 12).map(p => `• ${money(p.amount)}${p.date ? ' – ' + dmy(p.date) : ''}${p.method ? ' – ' + p.method : ''}${p.note ? ' (' + p.note + ')' : ''}`)
+    ]),
+    ...section('✍️ חוזה', [
+      c.signed || c.status === 'signed' ? 'סטטוס: חתום ✓' : (c.sent || c.status === 'sent' ? 'סטטוס: נשלח, ממתין לחתימה' : 'סטטוס: טרם נשלח'),
+      c.endTime ? `שעת סיום לפי החוזה: ${c.endTime}` : '',
+      c.extraHourRate ? `שעה נוספת: ${money(c.extraHourRate)}` : ''
+    ]),
+    ...section('📝 שאלון הזוג', [
+      q.coupleNames ? `שמות: ${q.coupleNames}` : '',
+      q.dayContact ? `איש קשר ביום האירוע: ${q.dayContact}${q.dayPhone ? ' – ' + q.dayPhone : ''}` : '',
+      q.prepTime ? `התארגנות / תחילת צילום: ${q.prepTime}` : '',
+      q.timeline ? `לוח זמנים:\n${q.timeline}` : '',
+      q.mustPhotograph ? `חובה לצלם:\n${q.mustPhotograph}` : '',
+      q.styleRequests ? `בקשות וסגנון:\n${q.styleRequests}` : '',
+      q.restrictions ? `מגבלות / דגשים:\n${q.restrictions}` : ''
+    ]),
+    ...section('🗒️ הערות', [e.notes ? String(e.notes).trim() : '', e.clientNote ? `הערות הלקוח: ${String(e.clientNote).trim()}` : '']),
+    base ? `\n🔗 פתיחת כרטיס האירוע במערכת:\n${base}/?event=${encodeURIComponent(e.id)}` : '',
+    `\n${safeString(data?.business?.name || 'Studio Manager', 120)}`
+  ].filter(Boolean);
+  let description = lines.join('\n');
+  if (description.length > 7800) description = description.slice(0, 7700) + '\n…(ההמשך בכרטיס האירוע במערכת)';
+  return { summary: `📸 ${typeName} – ${who}`, description, location: [e.venue, e.venueAddress].map(x => String(x || '').trim()).filter(Boolean).join(', ') };
+}
+function calendarReminderList(e, data) {
+  const s = data?.reminderSettings || {}, r = e.reminders || {};
+  const list = [];
+  if (s.weekBefore !== false && r.weekBefore !== false) list.push(10080);
+  if (s.dayBefore !== false && r.dayBefore !== false) list.push(1440);
+  const extra = Math.round(Number(data?.cloud?.googleCalendarReminderMinutes) || 0);
+  if (extra >= 5 && extra <= 40320) list.push(extra);
+  return [...new Set(list)].slice(0, 5);
+}
+function buildGoogleEvent(e, data, base) {
+  const timing = eventTiming(e);
+  if (!timing) return null;
+  const text = calendarEventText(e, data, base);
+  const body = {
+    summary: safeString(text.summary, 220), description: safeString(text.description, 8000), location: safeString(text.location, 500),
+    start: timing.allDay ? { date: timing.startDate } : { dateTime: `${timing.startDate}T${timing.startTime}:00`, timeZone: CAL_TZ },
+    end: timing.allDay ? { date: timing.endDate } : { dateTime: `${timing.endDate}T${timing.endTime}:00`, timeZone: CAL_TZ },
+    reminders: { useDefault: false, overrides: calendarReminderList(e, data).map(minutes => ({ method: 'popup', minutes })) },
+    visibility: 'default', transparency: 'opaque', colorId: CAL_COLORS[e.type] || '8', status: 'confirmed',
+    extendedProperties: { private: { studioManagerEventId: safeString(e.id, 120) } }
+  };
+  return body;
+}
+function calendarLink(eventId) {
+  const v = store.calendarLinks[eventId];
+  if (!v) return null;
+  return typeof v === 'string' ? { googleId: v } : v;
+}
+async function readManagerData() {
+  try { return JSON.parse(await fs.readFile(MANAGER_DB_FILE, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+function scheduleCalendarSync(base, delay = 2500) {
+  clearTimeout(calendarTimer);
+  calendarTimer = setTimeout(() => { runCalendarSync({ base }).catch(e => console.error('Calendar sync failed:', e.message)); }, delay);
+}
+function runCalendarSync(options = {}) {
+  const job = calendarQueue.then(() => doCalendarSync(options));
+  calendarQueue = job.catch(() => {});
+  return job;
+}
+async function doCalendarSync({ force = false, base = BASE_URL, onlyEventId = '' } = {}) {
+  const started = new Date().toISOString();
+  const finish = (patch) => { calendarStatus = { ...calendarStatus, lastRunAt: started, ...patch }; return calendarStatus; };
+  if (!googleCredentialsReady()) return finish({ ok: false, message: 'חסרים בשרת GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET', needsReconnect: false });
+  if (!googleToken?.refresh_token) return finish({ ok: false, message: 'יומן Google לא מחובר', needsReconnect: true });
+  const data = await readManagerData();
+  if (!data || !Array.isArray(data.events)) return finish({ ok: true, message: 'אין עדיין נתונים בשרת לסנכרון' });
+  if (data.cloud?.googleCalendarSyncEnabled === false) return finish({ ok: true, message: 'הסנכרון האוטומטי כבוי בהגדרות' });
+  let accessToken;
+  try { accessToken = await googleAccessToken(); }
+  catch (err) { return finish({ ok: false, message: err.message, needsReconnect: !!err.needsReconnect }); }
+  let created = 0, updated = 0, deleted = 0, skipped = 0; const errors = []; let changedLinks = false;
+  const events = data.events.filter(e => e && e.id && (!onlyEventId || e.id === onlyEventId));
+  for (const e of events) {
+    const body = buildGoogleEvent(e, data, base);
+    const link = calendarLink(e.id);
+    if (!body) {
+      // Event lost its date: remove it from Google so the calendar doesn't show stale bookings.
+      if (link?.googleId) {
+        try { await googleCalendarRequest('DELETE', `/calendars/primary/events/${encodeURIComponent(link.googleId)}?sendUpdates=none`, accessToken); } catch (err) { if (![404, 410].includes(err.httpStatus)) { errors.push({ eventId: e.id, name: e.clientName || '', message: err.message }); continue; } }
+        delete store.calendarLinks[e.id]; changedLinks = true; deleted++;
+      }
+      continue;
+    }
+    const hash = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 32);
+    if (!force && link?.googleId && link.hash === hash) { skipped++; continue; }
+    try {
+      let result = null, action = 'updated';
+      if (link?.googleId) {
+        try { result = await googleCalendarRequest('PATCH', `/calendars/primary/events/${encodeURIComponent(link.googleId)}?sendUpdates=none`, accessToken, body); }
+        catch (err) { if (![404, 410].includes(err.httpStatus)) throw err; }
+      }
+      if (!result) { result = await googleCalendarRequest('POST', '/calendars/primary/events?sendUpdates=none', accessToken, body); action = 'created'; }
+      store.calendarLinks[e.id] = { googleId: result.id, htmlLink: result.htmlLink || '', hash, syncedAt: new Date().toISOString() };
+      changedLinks = true;
+      if (action === 'created') created++; else updated++;
+    } catch (err) {
+      if (err.needsReconnect) return finish({ ok: false, message: err.message, needsReconnect: true });
+      errors.push({ eventId: e.id, name: e.clientName || '', message: err.message });
+    }
+  }
+  if (!onlyEventId) {
+    const liveIds = new Set(data.events.map(e => e?.id).filter(Boolean));
+    for (const key of Object.keys(data.deleted || {})) {
+      if (!key.startsWith('events:')) continue;
+      const id = key.slice(7);
+      if (liveIds.has(id)) continue;
+      const link = calendarLink(id);
+      if (!link?.googleId) continue;
+      try { await googleCalendarRequest('DELETE', `/calendars/primary/events/${encodeURIComponent(link.googleId)}?sendUpdates=none`, accessToken); }
+      catch (err) { if (![404, 410].includes(err.httpStatus)) { errors.push({ eventId: id, name: '', message: err.message }); continue; } }
+      delete store.calendarLinks[id]; changedLinks = true; deleted++;
+    }
+  }
+  if (changedLinks) await persist();
+  const msg = errors.length ? `${errors.length} אירועים לא סונכרנו` : 'היומן מעודכן';
+  return finish({ ok: errors.length === 0, message: msg, created, updated, deleted, skipped, errors: errors.slice(0, 50), needsReconnect: false });
+}
+function publicCalendarStatus() {
+  const links = {};
+  for (const [id, v] of Object.entries(store.calendarLinks || {})) { const l = typeof v === 'string' ? { googleId: v } : v; links[id] = { syncedAt: l.syncedAt || null, htmlLink: l.htmlLink || '' }; }
+  return { ...calendarStatus, links };
+}
+/* ---------- ICS calendar feed (subscribe from Google / Apple / Outlook without OAuth) ---------- */
+function icsEscape(v) { return String(v ?? '').replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/([;,])/g, '\\$1'); }
+function icsFold(line) {
+  const out = []; let cur = ''; let bytes = 0;
+  for (const ch of line) {
+    const b = Buffer.byteLength(ch);
+    if (bytes + b > (out.length ? 74 : 75)) { out.push(cur); cur = ''; bytes = 0; }
+    cur += ch; bytes += b;
+  }
+  out.push(cur);
+  return out.join('\r\n ');
+}
+function icsUtc(ms) { return new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); }
+function buildIcsFeed(data, base) {
+  const name = safeString(data?.business?.name || 'Studio Manager', 120);
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Studio Manager PRO//HE', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', `X-WR-CALNAME:${icsEscape('אירועי צילום · ' + name)}`, `X-WR-TIMEZONE:${CAL_TZ}`, 'REFRESH-INTERVAL;VALUE=DURATION:PT1H', 'X-PUBLISHED-TTL:PT1H'];
+  const stamp = icsUtc(Date.now());
+  for (const e of (data?.events || [])) {
+    if (!e?.id) continue;
+    const timing = eventTiming(e); if (!timing) continue;
+    const text = calendarEventText(e, data, base);
+    lines.push('BEGIN:VEVENT', `UID:${icsEscape(e.id)}@studio-manager`, `DTSTAMP:${stamp}`);
+    if (timing.allDay) lines.push(`DTSTART;VALUE=DATE:${timing.startDate.replace(/-/g, '')}`, `DTEND;VALUE=DATE:${timing.endDate.replace(/-/g, '')}`);
+    else lines.push(`DTSTART:${icsUtc(zonedToUtcMs(timing.startDate, timing.startTime))}`, `DTEND:${icsUtc(zonedToUtcMs(timing.endDate, timing.endTime))}`);
+    lines.push(`SUMMARY:${icsEscape(text.summary)}`, `DESCRIPTION:${icsEscape(text.description)}`);
+    if (text.location) lines.push(`LOCATION:${icsEscape(text.location)}`);
+    if (e.updatedAt) { const t = Date.parse(e.updatedAt); if (Number.isFinite(t)) lines.push(`LAST-MODIFIED:${icsUtc(t)}`); }
+    for (const minutes of calendarReminderList(e, data)) lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEscape(text.summary)}`, `TRIGGER:-PT${minutes}M`, 'END:VALARM');
+    lines.push('END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+  return lines.map(icsFold).join('\r\n') + '\r\n';
+}
+async function writeDailyBackup(existingRaw) {
+  try {
+    await fs.mkdir(BACKUP_DIR, { recursive: true });
+    const day = new Date().toISOString().slice(0, 10);
+    const file = path.join(BACKUP_DIR, `manager-db-${day}.json`);
+    try { await fs.access(file); return; } catch {}
+    await fs.writeFile(file, existingRaw, { mode: 0o600 });
+    const all = (await fs.readdir(BACKUP_DIR)).filter(f => /^manager-db-\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort();
+    for (const old of all.slice(0, Math.max(0, all.length - BACKUP_KEEP))) await fs.unlink(path.join(BACKUP_DIR, old)).catch(() => {});
+  } catch (e) { console.error('Daily backup failed:', e.message); }
 }
 function validIsoDate(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
@@ -298,12 +557,55 @@ const server = http.createServer(async (req, res) => {
         const userInfo = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
         if (userInfo.ok) { const profile = await userInfo.json(); googleToken.email = safeString(profile.email, 200); }
       } catch {}
+      cachedAccessToken = null;
       await saveGoogleToken();
+      calendarStatus = { ...calendarStatus, needsReconnect: false, message: 'החיבור הושלם – מסנכרן…' };
+      runCalendarSync({ force: true, base: requestBase(req) }).catch(e => console.error('Initial calendar sync failed:', e.message));
       res.writeHead(302, { Location: `${requestBase(req)}/?google_calendar=connected`, 'Cache-Control': 'no-store' }); res.end(); return;
     }
     if (req.method === 'GET' && url.pathname === '/api/admin/google-calendar/status') {
       if (!adminAuthorized(req)) return authFailure(res);
-      return json(res, 200, { configured: googleCredentialsReady(), connected: !!googleToken?.refresh_token, email: googleToken?.email || '', connectedAt: googleToken?.connectedAt || null, timeZone: 'Asia/Jerusalem' });
+      return json(res, 200, { configured: googleCredentialsReady(), connected: !!googleToken?.refresh_token && !googleToken?.invalid, needsReconnect: !!googleToken?.invalid || !!calendarStatus.needsReconnect && !!googleToken?.refresh_token, email: googleToken?.email || '', connectedAt: googleToken?.connectedAt || null, timeZone: CAL_TZ, redirectUri: googleRedirectUri(req), sync: publicCalendarStatus() });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/admin/google-calendar/sync') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      const body = await readBody(req);
+      const result = await runCalendarSync({ force: body.force === true, base: requestBase(req), onlyEventId: safeString(body.eventId, 120) });
+      return json(res, 200, { ...publicCalendarStatus(), ...result, links: publicCalendarStatus().links });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/admin/calendar-feed') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      if (!auth.icsToken) { auth.icsToken = crypto.randomBytes(24).toString('base64url'); await persistAuth(); }
+      return json(res, 200, { url: `${requestBase(req)}/calendar/${auth.icsToken}.ics` });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/admin/calendar-feed/rotate') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      auth.icsToken = crypto.randomBytes(24).toString('base64url'); await persistAuth();
+      return json(res, 200, { url: `${requestBase(req)}/calendar/${auth.icsToken}.ics` });
+    }
+    if (req.method === 'GET' && parts[0] === 'calendar' && parts.length === 2 && /\.ics$/.test(parts[1])) {
+      const token = parts[1].slice(0, -4);
+      const a = Buffer.from(token), b = Buffer.from(String(auth.icsToken || ''));
+      if (!auth.icsToken || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return json(res, 404, { error: 'הקישור אינו קיים' });
+      const data = await readManagerData();
+      const body = Buffer.from(buildIcsFeed(data || { events: [] }, requestBase(req)));
+      res.writeHead(200, { 'Content-Type': 'text/calendar; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-cache, max-age=0', 'Content-Disposition': 'inline; filename="studio-manager.ics"', 'X-Content-Type-Options': 'nosniff' });
+      res.end(body); return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/admin/backups') {
+      if (!adminAuthorized(req)) return authFailure(res);
+      let files = [];
+      try { files = (await fs.readdir(BACKUP_DIR)).filter(f => /^manager-db-\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort().reverse(); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      const rows = [];
+      for (const f of files) { const st = await fs.stat(path.join(BACKUP_DIR, f)).catch(() => null); rows.push({ name: f, date: f.slice(11, 21), bytes: st?.size || 0 }); }
+      let revision = null; try { revision = (await readManagerData())?.meta?.serverRevision || null; } catch {}
+      return json(res, 200, { backups: rows, revision });
+    }
+    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'backups' && parts[3]) {
+      if (!adminAuthorized(req)) return authFailure(res);
+      if (!/^manager-db-\d{4}-\d{2}-\d{2}\.json$/.test(parts[3])) return json(res, 400, { error: 'שם גיבוי לא תקין' });
+      try { return json(res, 200, { ok: true, data: JSON.parse(await fs.readFile(path.join(BACKUP_DIR, parts[3]), 'utf8')) }); }
+      catch (e) { if (e.code === 'ENOENT') return json(res, 404, { error: 'הגיבוי לא נמצא' }); throw e; }
     }
     if (req.method === 'POST' && url.pathname === '/api/admin/google-calendar/connect') {
       if (!adminAuthorized(req)) return authFailure(res);
@@ -317,33 +619,41 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'DELETE' && url.pathname === '/api/admin/google-calendar') {
       if (!adminAuthorized(req)) return authFailure(res);
-      googleToken = null;
+      googleToken = null; cachedAccessToken = null;
+      calendarStatus = { ...calendarStatus, ok: null, message: 'יומן Google נותק', needsReconnect: false };
       try { await fs.unlink(googleTokenFile()); } catch {}
       return json(res, 200, { ok: true, connected: false });
     }
     if (req.method === 'POST' && url.pathname === '/api/admin/google-calendar/events') {
+      // Legacy endpoint used by older app versions. The event is synced from the full server copy when it exists there.
       if (!adminAuthorized(req)) return authFailure(res);
       const body = await readBody(req);
       const eventId = safeString(body.eventId, 120), date = safeString(body.date, 10);
       if (!eventId || !validIsoDate(date)) return json(res, 400, { error: 'חסרים מזהה אירוע או תאריך תקין' });
-      const reminderMinutes = Math.min(10080, Math.max(5, Math.round(Number(body.reminderMinutes) || 1440)));
-      const reminderList = Array.isArray(body.reminderMinutesList) ? [...new Set(body.reminderMinutesList.map(x => Math.min(10080, Math.max(5, Math.round(Number(x) || 0)))).filter(x => x >= 5))].slice(0, 5) : [reminderMinutes];
-      const eventBody = {
-        summary: safeString(body.summary, 220) || 'אירוע צילום',
-        location: safeString(body.location, 500),
-        description: safeString(body.description, 4000),
-        start: { date }, end: { date: addOneDay(date) },
-        reminders: { useDefault: false, overrides: reminderList.map(minutes => ({ method: 'popup', minutes })) },
-        visibility: 'private', colorId: '5'
-      };
-      const accessToken = await googleAccessToken();
-      const existingId = safeString(body.googleEventId || store.calendarLinks[eventId] || '', 200);
-      const apiResult = existingId
-        ? await googleCalendarRequest('PATCH', `/calendars/primary/events/${encodeURIComponent(existingId)}?sendUpdates=none`, accessToken, eventBody)
-        : await googleCalendarRequest('POST', '/calendars/primary/events?sendUpdates=none', accessToken, eventBody);
-      store.calendarLinks[eventId] = apiResult.id;
-      await persist();
-      return json(res, 200, { ok: true, action: existingId ? 'updated' : 'created', googleEventId: apiResult.id, htmlLink: apiResult.htmlLink || '', summary: apiResult.summary || eventBody.summary });
+      const data = await readManagerData().catch(() => null);
+      if (data?.events?.some(e => e?.id === eventId && e.date === date)) {
+        const result = await runCalendarSync({ force: true, base: requestBase(req), onlyEventId: eventId });
+        const link = calendarLink(eventId), err = (result.errors || []).find(x => x.eventId === eventId);
+        if (!link || err) return json(res, result.needsReconnect ? 409 : 502, { error: err?.message || result.message || 'הסנכרון נכשל' });
+        return json(res, 200, { ok: true, action: 'updated', googleEventId: link.googleId, htmlLink: link.htmlLink || '' });
+      }
+      const fallback = { id: eventId, date, clientName: safeString(body.summary, 220), venue: safeString(body.location, 500), notes: safeString(body.description, 3000), type: 'other' };
+      const job = calendarQueue.then(async () => {
+        const accessToken = await googleAccessToken();
+        const eventBody = buildGoogleEvent(fallback, data || {}, requestBase(req));
+        eventBody.summary = safeString(body.summary, 220) || eventBody.summary;
+        eventBody.description = safeString(body.description, 4000);
+        const existing = calendarLink(eventId);
+        let apiResult = null;
+        if (existing?.googleId) { try { apiResult = await googleCalendarRequest('PATCH', `/calendars/primary/events/${encodeURIComponent(existing.googleId)}?sendUpdates=none`, accessToken, eventBody); } catch (err) { if (![404, 410].includes(err.httpStatus)) throw err; } }
+        if (!apiResult) apiResult = await googleCalendarRequest('POST', '/calendars/primary/events?sendUpdates=none', accessToken, eventBody);
+        store.calendarLinks[eventId] = { googleId: apiResult.id, htmlLink: apiResult.htmlLink || '', hash: '', syncedAt: new Date().toISOString() };
+        await persist();
+        return apiResult;
+      });
+      calendarQueue = job.catch(() => {});
+      const apiResult = await job;
+      return json(res, 200, { ok: true, action: 'updated', googleEventId: apiResult.id, htmlLink: apiResult.htmlLink || '', summary: apiResult.summary || '' });
     }
     if (req.method === 'GET' && url.pathname === '/api/admin/manager-db') {
       if (!adminAuthorized(req)) return authFailure(res);
@@ -361,15 +671,18 @@ const server = http.createServer(async (req, res) => {
       if (!adminAuthorized(req)) return authFailure(res);
       const body = await readBody(req), data = body.data;
       if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.events) || !Array.isArray(data.packages)) return json(res, 400, { error: 'מבנה גיבוי לא תקין' });
-      let currentRevision = null;
-      try { currentRevision = JSON.parse(await fs.readFile(MANAGER_DB_FILE, 'utf8'))?.meta?.serverRevision || null; } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      const baseRevision = body.baseRevision === undefined ? undefined : (body.baseRevision || null);
-      if (baseRevision !== undefined && currentRevision && baseRevision !== currentRevision) return json(res, 409, { error: 'הנתונים עודכנו ממכשיר אחר', revision: currentRevision });
+      let currentRevision = null, currentRaw = null, currentEvents = 0;
+      try { currentRaw = await fs.readFile(MANAGER_DB_FILE, 'utf8'); const cur = JSON.parse(currentRaw); currentRevision = cur?.meta?.serverRevision || null; currentEvents = Array.isArray(cur?.events) ? cur.events.length : 0; } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      // A device that does not know the current revision must merge first – never blindly overwrite the server copy.
+      const baseRevision = body.baseRevision || null;
+      if (currentRevision && baseRevision !== currentRevision) return json(res, 409, { error: 'הנתונים עודכנו ממכשיר אחר', revision: currentRevision });
+      if (currentEvents >= 3 && data.events.length === 0 && body.allowEmpty !== true) return json(res, 409, { error: 'נחסמה שמירה של מאגר ריק במקום נתונים קיימים. רעננו את הדף.', revision: currentRevision });
       const revision = new Date().toISOString() + '-' + crypto.randomBytes(4).toString('hex');
       const safeData = { ...data, cloud: { ...(data.cloud || {}), adminKey: '' }, meta: { ...(data.meta || {}), serverRevision: revision } };
       const serialized = JSON.stringify(safeData, null, 2);
       if (Buffer.byteLength(serialized) > 15 * 1024 * 1024) return json(res, 413, { error: 'גיבוי הענן גדול מדי. הסר תמונות כבדות ונסה שוב.' });
       await fs.mkdir(DATA_DIR, { recursive: true });
+      if (currentRaw) await writeDailyBackup(currentRaw);
       try {
         const existing = await fs.readFile(MANAGER_DB_FILE, 'utf8');
         const previousTmp = MANAGER_DB_FILE + '.previous.tmp';
@@ -379,8 +692,10 @@ const server = http.createServer(async (req, res) => {
       const tmp = MANAGER_DB_FILE + '.tmp';
       await fs.writeFile(tmp, serialized, { mode: 0o600 });
       await fs.rename(tmp, MANAGER_DB_FILE);
+      if (googleCredentialsReady() && googleToken?.refresh_token && !googleToken.invalid) scheduleCalendarSync(requestBase(req));
       return json(res, 200, { ok: true, savedAt: new Date().toISOString(), revision, bytes: Buffer.byteLength(serialized) });
     }
+    if (req.method === 'GET' && url.pathname === '/privacy') return html(res, 200, '<!doctype html><html lang="he" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>מדיניות פרטיות – Studio Manager</title><body style="font-family:Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.8;color:#222"><h1>מדיניות פרטיות – Studio Manager</h1><p>Studio Manager היא מערכת ניהול פנימית של העסק "צילום ברמה אחרת – אופיר מרדכי", המשמשת לניהול אירועי צילום, לקוחות, חוזים ותשלומים.</p><h3>חיבור ליומן Google</h3><p>המערכת מבקשת הרשאה ליומן Google של בעל העסק בלבד (calendar.events), כדי ליצור, לעדכן ולמחוק ביומן את אירועי הצילום שנרשמו במערכת. המערכת אינה קוראת אירועים אחרים ביומן, אינה משתפת את המידע עם צד שלישי ואינה משתמשת בו לפרסום.</p><h3>שמירת מידע</h3><p>פרטי לקוחות ואירועים נשמרים בשרת העסק לצורך ניהול ההזמנות בלבד. אסימון הגישה ל-Google נשמר בשרת בצורה מוצפנת, ואפשר לבטל אותו בכל עת מהגדרות המערכת או מהגדרות חשבון Google.</p><h3>יצירת קשר</h3><p>טלפון: 050-7464905</p></body></html>');
     if (req.method === 'GET' && url.pathname === '/') return serveFile(res, path.join(PUBLIC, 'index.html'), 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/manager.webmanifest') return serveFile(res, path.join(PUBLIC, 'manager.webmanifest'), 'application/manifest+json; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/manager-sw.js') { const file = await fs.readFile(path.join(PUBLIC, 'manager-sw.js')); res.writeHead(200, { 'Content-Type':'application/javascript; charset=utf-8', 'Cache-Control':'no-cache', 'Service-Worker-Allowed':'/' }); res.end(file); return; }
@@ -531,5 +846,8 @@ const server = http.createServer(async (req, res) => {
 
 load().then(() => {
   if (!ADMIN_KEY) console.warn('WARNING: STUDIO_ADMIN_KEY is not set. Admin API requests will be rejected. Set a long random secret before use.');
+  console.log(`Data directory: ${DATA_DIR}${DATA_DIR.startsWith(ROOT) ? ' (inside the app folder – keep it when uploading updates, or set STUDIO_DATA_DIR to a persistent location)' : ''}`);
+  console.log(`Google Calendar OAuth: ${googleCredentialsReady() ? 'configured' : 'NOT configured (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET)'}${googleToken?.refresh_token ? ', account connected' : ''}${googleToken?.invalid ? ' – NEEDS RECONNECT' : ''}`);
+  if (googleCredentialsReady() && googleToken?.refresh_token && !googleToken.invalid) setTimeout(() => runCalendarSync({}).catch(e => console.error('Startup calendar sync failed:', e.message)), 8000);
   server.listen(PORT, '0.0.0.0', () => console.log(`Studio Manager Online listening on port ${PORT}${BASE_URL ? ` (${BASE_URL})` : ''}`));
 }).catch(err => { console.error(err); process.exit(1); });
