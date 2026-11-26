@@ -1287,7 +1287,7 @@ function wazeUrl(e){return 'https://waze.com/ul?navigate=yes&q='+encodeURICompon
 function googleTemplateUrl(e){
   const p=new URLSearchParams({action:'TEMPLATE',text:`📸 ${typeLabel(e.type)} – ${clientNames(e)}`,details:[e.clientPhone?'טלפון: '+e.clientPhone:'',e.packageName?'חבילה: '+e.packageName:'',`יתרה לתשלום: ${money(totalDue(e))}`].filter(Boolean).join('\n'),location:[e.venue,e.venueAddress].filter(Boolean).join(', '),ctz:'Asia/Jerusalem'});
   const d=String(e.date||'').replace(/-/g,''),valid=t=>/^\d{2}:\d{2}$/.test(t||'');
-  if(valid(e.time)){let end=valid(e.endTime)?e.endTime:(valid(e.contract?.endTime)?e.contract.endTime:'');let ed=d;
+  if(valid(e.time)){let end=valid(e.endTime)?e.endTime:(valid(e.contract?.endTime)?e.contract.endTime:'');if(end===e.time)end='';let ed=d;
     if(!end){const [h,m]=e.time.split(':').map(Number);const total=h*60+m+360;end=String(Math.floor(total/60)%24).padStart(2,'0')+':'+String(total%60).padStart(2,'0');if(total>=1440)ed=addDaysISO(e.date,1).replace(/-/g,'')}
     else if(end<=e.time)ed=addDaysISO(e.date,1).replace(/-/g,'');
     p.set('dates',`${d}T${e.time.replace(':','')}00/${ed}T${end.replace(':','')}00`)}
