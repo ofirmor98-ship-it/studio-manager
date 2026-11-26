@@ -1,0 +1,16 @@
+{
+ "manifest": {
+  "v": 1,
+  "app": "clst",
+  "version": "2.82",
+  "build": "2.82",
+  "date": "26.11.2026",
+  "notes": "",
+  "url": "https://github.com/ofirmor98-ship-it/studio-manager/releases/download/cs-v2.82-20261126-0223/ClickStick-2.82-20261126-0223.zip",
+  "sha256": "4d04723f8edfa64ea7017ecdb848ddac31559dde0781e9be754e0f9137a5220b",
+  "size": 8841689,
+  "mandatory": false
+ },
+ "sig": "k6RmuS3_xRRlR2yHVLBObM8L86mhJKl2All7MPaXCpzugnAfvpOp2ytZu0E0eqIoh4imwAPSFRyDrhs4fUInAw",
+ "body": "eyJhcHAiOiJjbHN0IiwiYnVpbGQiOiIyLjgyIiwiZGF0ZSI6IjI2LjExLjIwMjYiLCJtYW5kYXRvcnkiOmZhbHNlLCJub3RlcyI6IiIsInNoYTI1NiI6IjRkMDQ3MjNmOGVkZmE2NGVhNzAxN2VjZGI4NDhkZGFjMzE1NTlkZGUwNzgxZTliZTc1NGUwZjkxMzdhNTIyMGIiLCJzaXplIjo4ODQxNjg5LCJ1cmwiOiJodHRwczovL2dpdGh1Yi5jb20vb2Zpcm1vcjk4LXNoaXAtaXQvc3R1ZGlvLW1hbmFnZXIvcmVsZWFzZXMvZG93bmxvYWQvY3MtdjIuODItMjAyNjExMjYtMDIyMy9DbGlja1N0aWNrLTIuODItMjAyNjExMjYtMDIyMy56aXAiLCJ2IjoxLCJ2ZXJzaW9uIjoiMi44MiJ9"
+}
