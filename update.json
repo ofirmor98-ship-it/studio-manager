@@ -2,14 +2,14 @@
  "manifest": {
   "v": 1,
   "app": "AI Photo Studio Pro",
-  "version": "1.32.1",
-  "build": "1.32.1-fix51b",
-  "date": "24.11.2026",
+  "version": "1.33.0",
+  "build": "1.33.0-fix53",
+  "date": "26.11.2026",
   "notes": "",
-  "url": "https://github.com/ofirmor98-ship-it/studio-manager/releases/download/v1.32.1-fix51b-20261124-1551/AIPS-1.32.1-fix51b-20261124-1551.zip",
-  "sha256": "75b25e8ae803d29f6876ed70da27ec00921dcf9d24b74db8e027184e37b841ba",
-  "size": 24613924,
+  "url": "https://github.com/ofirmor98-ship-it/studio-manager/releases/download/v1.33.0-fix53-20261126-0952/AIPS-1.33.0-fix53-20261126-0952.zip",
+  "sha256": "dd0ebf002584a4321d0eb34658c5c13306738d2c40b3f6bc6327b2d9f6560563",
+  "size": 34440326,
   "mandatory": false
  },
- "sig": "9Xrwza5oN5cJXb1pg66jLshnJaRUBG2oU4eXBisEvELeiZMlxgTnGI42er02ukgnnyAV1yhjdmqEAZFNClAgAg"
+ "sig": "BLabgQr5jmB6xrvv07sl2_Fttho3x7k6juB-LaprTGtN7BjdgAykVK07HILrMIDovKJs1NBJEFJq2eczrTUyBw"
 }
