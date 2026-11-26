@@ -228,9 +228,9 @@ function eventTiming(e) {
   if (!start) return { allDay: true, startDate: date, endDate: addOneDay(date) };
   const endRaw = validTime(e.endTime) ? e.endTime : (validTime(e.contract?.endTime) ? e.contract.endTime : '');
   let end;
-  if (endRaw) { end = { date: endRaw > start ? date : addOneDay(date), time: endRaw }; }
+  if (endRaw && endRaw !== start) { end = { date: endRaw > start ? date : addOneDay(date), time: endRaw }; }
   else end = shiftLocal(date, start, 6 * 60);
-  return { allDay: false, startDate: date, startTime: start, endDate: end.date, endTime: end.time, defaultEnd: !endRaw };
+  return { allDay: false, startDate: date, startTime: start, endDate: end.date, endTime: end.time, defaultEnd: !endRaw || endRaw === start };
 }
 function eventDueAmount(e) {
   const paid = (Array.isArray(e.payments) ? e.payments : []).reduce((s, p) => s + (Number(p?.amount) || 0), 0);
@@ -336,7 +336,7 @@ function runCalendarSync(options = {}) {
   calendarQueue = job.catch(() => {});
   return job;
 }
-async function doCalendarSync({ force = false, base = BASE_URL, onlyEventId = '' } = {}) {
+async function doCalendarSync({ force = false, base = '', onlyEventId = '' } = {}) { base = base || BASE_URL || store.publicBase || '';
   const started = new Date().toISOString();
   const finish = (patch) => { calendarStatus = { ...calendarStatus, lastRunAt: started, ...patch }; return calendarStatus; };
   if (!googleCredentialsReady()) return finish({ ok: false, message: 'חסרים בשרת GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET', needsReconnect: false });
@@ -692,7 +692,7 @@ const server = http.createServer(async (req, res) => {
       const tmp = MANAGER_DB_FILE + '.tmp';
       await fs.writeFile(tmp, serialized, { mode: 0o600 });
       await fs.rename(tmp, MANAGER_DB_FILE);
-      if (googleCredentialsReady() && googleToken?.refresh_token && !googleToken.invalid) scheduleCalendarSync(requestBase(req));
+      if (googleCredentialsReady() && googleToken?.refresh_token && !googleToken.invalid) scheduleCalendarSync(requestBase(req)); store.publicBase = requestBase(req);
       return json(res, 200, { ok: true, savedAt: new Date().toISOString(), revision, bytes: Buffer.byteLength(serialized) });
     }
     if (req.method === 'GET' && url.pathname === '/privacy') return html(res, 200, '<!doctype html><html lang="he" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>מדיניות פרטיות – Studio Manager</title><body style="font-family:Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.8;color:#222"><h1>מדיניות פרטיות – Studio Manager</h1><p>Studio Manager היא מערכת ניהול פנימית של העסק "צילום ברמה אחרת – אופיר מרדכי", המשמשת לניהול אירועי צילום, לקוחות, חוזים ותשלומים.</p><h3>חיבור ליומן Google</h3><p>המערכת מבקשת הרשאה ליומן Google של בעל העסק בלבד (calendar.events), כדי ליצור, לעדכן ולמחוק ביומן את אירועי הצילום שנרשמו במערכת. המערכת אינה קוראת אירועים אחרים ביומן, אינה משתפת את המידע עם צד שלישי ואינה משתמשת בו לפרסום.</p><h3>שמירת מידע</h3><p>פרטי לקוחות ואירועים נשמרים בשרת העסק לצורך ניהול ההזמנות בלבד. אסימון הגישה ל-Google נשמר בשרת בצורה מוצפנת, ואפשר לבטל אותו בכל עת מהגדרות המערכת או מהגדרות חשבון Google.</p><h3>יצירת קשר</h3><p>טלפון: 050-7464905</p></body></html>');
