@@ -365,7 +365,7 @@ async function doCalendarSync({ force = false, base = BASE_URL, onlyEventId = ''
     try {
       let result = null, action = 'updated';
       if (link?.googleId) {
-        try { result = await googleCalendarRequest('PATCH', `/calendars/primary/events/${encodeURIComponent(link.googleId)}?sendUpdates=none`, accessToken, body); }
+        try { result = await googleCalendarRequest('PUT', `/calendars/primary/events/${encodeURIComponent(link.googleId)}?sendUpdates=none`, accessToken, body); }
         catch (err) { if (![404, 410].includes(err.httpStatus)) throw err; }
       }
       if (!result) { result = await googleCalendarRequest('POST', '/calendars/primary/events?sendUpdates=none', accessToken, body); action = 'created'; }
@@ -645,7 +645,7 @@ const server = http.createServer(async (req, res) => {
         eventBody.description = safeString(body.description, 4000);
         const existing = calendarLink(eventId);
         let apiResult = null;
-        if (existing?.googleId) { try { apiResult = await googleCalendarRequest('PATCH', `/calendars/primary/events/${encodeURIComponent(existing.googleId)}?sendUpdates=none`, accessToken, eventBody); } catch (err) { if (![404, 410].includes(err.httpStatus)) throw err; } }
+        if (existing?.googleId) { try { apiResult = await googleCalendarRequest('PUT', `/calendars/primary/events/${encodeURIComponent(existing.googleId)}?sendUpdates=none`, accessToken, eventBody); } catch (err) { if (![404, 410].includes(err.httpStatus)) throw err; } }
         if (!apiResult) apiResult = await googleCalendarRequest('POST', '/calendars/primary/events?sendUpdates=none', accessToken, eventBody);
         store.calendarLinks[eventId] = { googleId: apiResult.id, htmlLink: apiResult.htmlLink || '', hash: '', syncedAt: new Date().toISOString() };
         await persist();
